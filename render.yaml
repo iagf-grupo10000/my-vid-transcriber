@@ -1,0 +1,15 @@
+# Render Blueprint - https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: yt-transcriber
+    runtime: node
+    region: ohio
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: HUGGINGFACE_TOKEN
+        sync: false
+      - key: NODE_ENV
+        value: production
