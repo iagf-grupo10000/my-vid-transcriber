@@ -1,0 +1,3 @@
+# Dependencias Python para transcripción local
+faster-whisper>=1.0.0
+soundfile>=0.12.0

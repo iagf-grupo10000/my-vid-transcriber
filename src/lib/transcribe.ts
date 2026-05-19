@@ -6,59 +6,94 @@ import axios from 'axios';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
-const CHUNK_SECONDS = 30;
-const HF_API_BASE_PREFIX = 'https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3-turbo';
 
-function getAudioDuration(filePath: string): Promise<number> {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, meta) => {
-      if (err) return reject(err);
-      resolve(meta.format.duration || 0);
-    });
-  });
-}
+// ─── Configuración vía variables de entorno ──────────────────────────────
+const WHISPER_MODEL = process.env.WHISPER_MODEL || 'base';
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'es';
+const WHISPER_BEAM_SIZE = parseInt(process.env.WHISPER_BEAM_SIZE || '5', 10);
+const WHISPER_DEVICE = process.env.WHISPER_DEVICE || 'cpu';
+const LANGUAGETOOL_ENABLED = process.env.LANGUAGETOOL_ENABLED !== 'false';
 
-function extractSegment(inputPath: string, outputDir: string, startSec: number, durationSec: number, index: number): Promise<string> {
+/**
+ * Convierte cualquier archivo de audio/video a WAV 16kHz mono,
+ * formato óptimo para faster-whisper.
+ */
+function convertToWav(inputPath: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const outPath = path.join(outputDir, `chunk-${String(index).padStart(4, '0')}.wav`);
     ffmpeg(inputPath)
-      .setStartTime(startSec).setDuration(durationSec)
-      .toFormat('wav').audioChannels(1).audioFrequency(16000)
-      .save(outPath)
-      .on('end', () => resolve(outPath))
-      .on('error', reject);
+      .toFormat('wav')
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .audioCodec('pcm_s16le')
+      .on('end', () => resolve())
+      .on('error', reject)
+      .save(outputPath);
   });
 }
 
-async function transcribeChunk(chunkPath: string, chunkIndex: number, chunkSeconds: number): Promise<{ startTime: string; text: string }> {
-  const HF_API_BASE = HF_API_BASE_PREFIX;
-  try {
-    const wavBytes = fs.readFileSync(chunkPath);
-    const res = await axios.post(HF_API_BASE, wavBytes, {
-      headers: {
-        Authorization: `Bearer ${process.env.HUGGINGFACE_TOKEN}`,
-        'Content-Type': 'audio/wav',
-        Accept: 'application/json',
-      },
-      timeout: 120_000,
-    });
-    const text = (res.data?.text || '').trim();
-    return { startTime: fmtTime(chunkIndex * chunkSeconds), text };
-  } catch (e: any) {
-    const detail = e.response?.data ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
-    throw new Error(`HF API error (chunk ${chunkIndex}): ${detail}`);
+/**
+ * Transcribe un archivo de audio llamando al bridge Python (faster-whisper local).
+ * Retorna el JSON parseado con segmentos, texto completo y metadatos.
+ */
+async function transcribeWithPython(audioPath: string): Promise<LocalTranscriptionResult> {
+  const scriptPath = path.join(process.cwd(), 'scripts', 'transcribe_local.py');
+
+  const args = [
+    scriptPath,
+    audioPath,
+    '--model', WHISPER_MODEL,
+    '--language', WHISPER_LANGUAGE,
+    '--beam-size', String(WHISPER_BEAM_SIZE),
+    '--device', WHISPER_DEVICE,
+  ];
+
+  const { stdout, stderr } = await execFileAsync('python3', args, { timeout: 600_000 });
+
+  // stderr contiene logs de progreso (model loading, timing)
+  for (const line of stderr.split('\n').filter(Boolean)) {
+    try {
+      const evt = JSON.parse(line);
+      if (evt.event) console.log(`[whisper] ${evt.event}:`, JSON.stringify(evt));
+    } catch {
+      // No es JSON, ignorar
+    }
   }
+
+  const result: LocalTranscriptionResult = JSON.parse(stdout);
+
+  if (!result.success) {
+    throw new Error(`Transcripción local falló: ${result.error || 'error desconocido'}`);
+  }
+
+  return result;
 }
 
-function fmtTime(s: number): string {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+interface LocalSegment {
+  start: number;
+  end: number;
+  text: string;
 }
 
+interface LocalTranscriptionResult {
+  success: boolean;
+  error?: string;
+  model: string;
+  language: string;
+  language_probability: number;
+  duration_seconds: number | null;
+  processing_seconds: number;
+  num_segments: number;
+  segments: LocalSegment[];
+  text: string;
+  text_with_timestamps: string;
+}
+
+/**
+ * Corrección gramatical opcional vía LanguageTool API.
+ * Deshabilitar con LANGUAGETOOL_ENABLED=false
+ */
 async function grammarFix(text: string): Promise<string> {
-  if (text.length < 10) return text;
+  if (!LANGUAGETOOL_ENABLED || text.length < 10) return text;
   try {
     const lt = await axios.post('https://api.languagetool.org/v2/check', null, {
       params: { text, language: 'es', enabledOnly: false },
@@ -73,12 +108,22 @@ async function grammarFix(text: string): Promise<string> {
       corrected = corrected.slice(0, m.offset) + m.replacements[0].value + corrected.slice(m.offset + m.length);
     }
     return corrected;
-  } catch { return text; }
+  } catch {
+    return text;
+  }
+}
+
+function fmtTime(s: number): string {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
 /**
  * Helper compartido: transcribe desde un archivo de audio.
  * Usado por YouTube y subida de archivos locales.
+ * Ahora usa faster-whisper LOCAL en vez de Hugging Face API.
  */
 export async function transcribeAudioFile(
   audioPath: string,
@@ -92,41 +137,42 @@ export async function transcribeAudioFile(
   chunks: number;
   sourceType: 'youtube' | 'local';
   sourceUrl?: string;
+  model: string;
+  language: string;
+  processingSeconds: number;
 }> {
   const tmpRoot = path.join(process.cwd(), 'tmp');
   const session = path.join(tmpRoot, `s-${Date.now()}`);
-  const chunksDir = path.join(session, 'chunks');
-  for (const d of [tmpRoot, session, chunksDir]) {
+  const wavPath = path.join(session, 'audio_16khz.wav');
+
+  for (const d of [tmpRoot, session]) {
     if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
   }
 
   try {
-    const totalSec = await getAudioDuration(audioPath);
-    const totalChunks = Math.ceil(totalSec / CHUNK_SECONDS);
-    const results: { startTime: string; text: string }[] = [];
+    // 1. Convertir el audio completo a WAV 16kHz mono (formato óptimo para Whisper)
+    console.log(`[whisper] Convirtiendo a WAV 16kHz: ${audioPath}`);
+    await convertToWav(audioPath, wavPath);
 
-    for (let i = 0; i < totalChunks; i++) {
-      const startSec = i * CHUNK_SECONDS;
-      const segDuration = Math.min(CHUNK_SECONDS, totalSec - startSec);
-      const wavPath = await extractSegment(audioPath, chunksDir, startSec, segDuration, i);
-      const result = await transcribeChunk(wavPath, i, CHUNK_SECONDS);
-      results.push(result);
-      try { fs.unlinkSync(wavPath); } catch {}
-      if (i < totalChunks - 1) await new Promise(r => setTimeout(r, 300));
-    }
+    // 2. Transcribir localmente con faster-whisper (sin chunking ni HF API)
+    console.log(`[whisper] Transcribiendo localmente (modelo: ${WHISPER_MODEL})...`);
+    const result = await transcribeWithPython(wavPath);
 
-    const rawText = results.map(r => r.text).filter(Boolean).join(' ');
-    const correctedText = await grammarFix(rawText);
-    const textWithTimestamps = results.filter(r => r.text).map(r => `[${r.startTime}] ${r.text}`).join('\n');
+    // 3. Corrección gramatical opcional
+    const textToFix = result.text;
+    const correctedText = textToFix ? await grammarFix(textToFix) : '';
 
     return {
       text: correctedText,
-      textWithTimestamps,
+      textWithTimestamps: result.text_with_timestamps,
       title: title || 'sin_titulo',
-      duration: fmtTime(totalSec),
-      chunks: totalChunks,
+      duration: fmtTime(result.duration_seconds || 0),
+      chunks: result.num_segments,
       sourceType: sourceUrl ? 'youtube' : 'local',
       sourceUrl,
+      model: result.model,
+      language: result.language,
+      processingSeconds: result.processing_seconds,
     };
   } finally {
     try { fs.rmSync(session, { recursive: true, force: true }); } catch {}

@@ -22,8 +22,8 @@ function generateTxt(data: ExportPayload): string {
     '',
     '═'.repeat(60),
     '',
-    'Generado por my-vid-transcriber · Whisper IA + LanguageTool',
-  ].join('\n');
+    'Generado por my-vid-transcriber · faster-whisper local',
+  ].join('\\n');
 }
 
 function generateMd(data: ExportPayload): string {
@@ -50,7 +50,7 @@ ${data.textWithTimestamps || data.text}
 
 ---
 
-*Generado por [my-vid-transcriber](https://github.com/iagf-grupo10000/my-vid-transcriber) · Whisper IA + LanguageTool*
+*Generado por [my-vid-transcriber](https://github.com/iagf-grupo10000/my-vid-transcriber) · faster-whisper local*
 `;
 }
 
@@ -121,7 +121,7 @@ async function generatePdf(data: ExportPayload): Promise<Buffer> {
   y -= 20;
   page.drawLine({ start: { x: 60, y }, end: { x: 552, y }, thickness: 1, color: rgb(0.9, 0.9, 0.9) });
   y -= 15;
-  writeLine('Generado por my-vid-transcriber · Whisper IA (Hugging Face) + LanguageTool', { size: 8, color: MUTED, center: true });
+  writeLine('Generado por my-vid-transcriber · faster-whisper local (CPU)', { size: 8, color: MUTED, center: true });
 
   return Buffer.from(await doc.save());
 }
