@@ -39,6 +39,9 @@ yarn-error.log*
 # temp audio files
 /tmp/
 
+# exported transcriptions
+/exports/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
